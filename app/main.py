@@ -24,11 +24,13 @@ from .database import (
     get_audit,
     init_db,
     insert_audit,
+    list_audit_results,
     list_audits,
     load_registry,
     package_count,
     upsert_package,
 )
+from .impact import build_impact_report
 from .models import (
     AuditResponse,
     AuditSummary,
@@ -37,10 +39,11 @@ from .models import (
     BundleVerifyIn,
     BundleVerifyResponse,
     HealthResponse,
+    ImpactResponse,
     ManifestIn,
     PackageIn,
 )
-from .semver import VersionError
+from .semver import Version, VersionError
 from .solver import Solver
 
 SEED_PATH = os.environ.get("AUDIT_SEED_PATH", "/app/data/seed_registry.json")
@@ -97,6 +100,7 @@ def index() -> dict:
             "GET /health",
             "POST /api/v1/audits",
             "GET /api/v1/audits",
+            "GET /api/v1/audits/impact/{package_name}",
             "GET /api/v1/audits/{audit_id}",
             "POST /api/v1/audits/export-bundle",
             "POST /api/v1/audits/verify-bundle",
@@ -212,6 +216,132 @@ def get_audits(
         for row in rows
     ]
     return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+
+@app.get(
+    "/api/v1/audits/impact/{package_name}",
+    response_model=ImpactResponse,
+    tags=["audits"],
+    summary="历史影响反查：哪些已持久化审计直接或传递依赖了指定包/版本",
+    responses={
+        200: {
+            "description": "命中的审计记录；包从未出现过时返回空结果（total=0、items=[]），不返回 404",
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "package_aggregate": {
+                            "summary": "按包聚合（不指定 version）",
+                            "value": {
+                                "package": "core-lib",
+                                "version": None,
+                                "status": None,
+                                "total": 2,
+                                "limit": 20,
+                                "offset": 0,
+                                "counts": {"feasible": 1, "infeasible": 1, "inconclusive": 0},
+                                "items": [
+                                    {
+                                        "audit_id": "8f1c…",
+                                        "created_at": "2026-09-22T08:00:00+00:00",
+                                        "status": "feasible",
+                                        "root_plugin": "megaplugin@1.0.0",
+                                        "match_type": "resolution",
+                                        "level": 2,
+                                        "versions": ["1.5.0"],
+                                        "chains": [
+                                            [
+                                                {"package": "megaplugin", "version_range": "=1.0.0", "version": "1.0.0"},
+                                                {"package": "authkit", "version_range": "=1.2.0", "version": "1.2.0"},
+                                                {"package": "core-lib", "version_range": ">=1.4.0 <2.0.0", "version": "1.5.0"},
+                                            ]
+                                        ],
+                                        "conflict_packages": [],
+                                    },
+                                    {
+                                        "audit_id": "3bd9…",
+                                        "created_at": "2026-09-21T10:00:00+00:00",
+                                        "status": "infeasible",
+                                        "root_plugin": None,
+                                        "match_type": "conflict",
+                                        "level": 2,
+                                        "versions": ["2.0.0"],
+                                        "chains": [
+                                            [
+                                                {"package": "<manifest>", "version_range": "*", "version": None},
+                                                {"package": "loggerkit", "version_range": "=0.9.0", "version": "0.9.0"},
+                                                {"package": "core-lib", "version_range": "^2.0.0", "version": "2.0.0"},
+                                            ]
+                                        ],
+                                        "conflict_packages": ["core-lib"],
+                                    },
+                                ],
+                            },
+                        },
+                        "unknown_package": {
+                            "summary": "未知包返回空结果而非 404",
+                            "value": {
+                                "package": "never-heard-of",
+                                "version": None,
+                                "status": None,
+                                "total": 0,
+                                "limit": 20,
+                                "offset": 0,
+                                "counts": {"feasible": 0, "infeasible": 0, "inconclusive": 0},
+                                "items": [],
+                            },
+                        },
+                    }
+                }
+            },
+        }
+    },
+)
+def get_audit_impact(
+    package_name: str,
+    request: Request,
+    version: Optional[str] = Query(
+        None,
+        description="可选，精确 SemVer 版本（如 1.5.0）；不提供时按包聚合所有版本",
+    ),
+    status_filter: Optional[str] = Query(
+        None,
+        alias="status",
+        pattern="^(feasible|infeasible|inconclusive)$",
+        description="可选，仅统计指定状态的审计",
+    ),
+    limit: int = Query(20, ge=1, le=MAX_LIMIT, description="返回条数上限（1～100）"),
+    offset: int = Query(0, ge=0),
+) -> ImpactResponse:
+    """扫描已持久化审计结果的 resolution、sources 与 conflicts，沿来源链
+    反查直接或传递依赖 ``package_name``（或其 ``version``）的审计记录。
+
+    - ``match_type=resolution``：包/版本出现在可行解中；
+    - ``match_type=conflict``：包/版本是冲突约束目标，或作为来源链上的中间提出者参与冲突；
+    - ``level`` 为命中层级（根插件 0、清单直接依赖 1、每深一跳 +1）；
+    - 按 level 升序、created_at 降序、audit_id 升序稳定排序，并汇总
+      feasible/infeasible/inconclusive 计数；
+    - 包从未出现在任何审计中时返回空结果（HTTP 200），不是 404。
+    """
+    normalized_version: Optional[str] = None
+    if version is not None:
+        normalized_version = str(Version.parse(version.strip()))  # VersionError -> 400
+
+    conn = get_conn(request)
+    rows = list_audit_results(conn, status=status_filter)
+    report = build_impact_report(
+        rows, package_name, version=normalized_version, status_filter=status_filter
+    )
+    page = report["items"][offset : offset + limit]
+    return ImpactResponse(
+        package=report["package"],
+        version=report["version"],
+        status=report["status"],
+        total=report["total"],
+        limit=limit,
+        offset=offset,
+        counts=report["counts"],
+        items=page,
+    )
 
 
 @app.get("/api/v1/audits/{audit_id}", response_model=AuditResponse, tags=["audits"])

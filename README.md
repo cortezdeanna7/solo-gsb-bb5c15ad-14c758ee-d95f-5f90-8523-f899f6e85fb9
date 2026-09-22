@@ -118,7 +118,86 @@ curl -s 'http://localhost:8000/api/v1/audits?status=infeasible' | jq
 curl -s http://localhost:8000/api/v1/audits/<id> | jq
 ```
 
-### 4. 导出可验证审计包并校验
+### 4. 历史影响反查：谁依赖了某个包/版本
+
+想知道某个包（或某个具体版本）发布/出问题后会波及哪些历史审计，可反查全部
+**已持久化**的审计结果。服务扫描每条结果的 `resolution`、`sources` 与
+`conflicts`，沿来源链计算该包被**直接**或**传递**依赖的层级，并明确区分两种命中：
+
+- `match_type=resolution`：包/版本出现在可行解中；
+- `match_type=conflict`：包/版本是冲突约束目标（含 `locked_version`），
+  或作为来源链上的中间提出者被传递拖入冲突；`conflict_packages` 给出关联的冲突目标包。
+
+`level` 为命中层级：根插件 `0`，清单直接声明的依赖 `1`，每深一跳 `+1`。
+
+```bash
+# 不指定 version：按包聚合所有版本
+curl -s http://localhost:8000/api/v1/audits/impact/core-lib | jq
+
+# 指定 version：只看该具体版本（支持 status / limit / offset）
+curl -s 'http://localhost:8000/api/v1/audits/impact/core-lib?version=1.5.0&status=feasible' | jq
+```
+
+返回（节选）：
+
+```json
+{
+  "package": "core-lib",
+  "version": null,
+  "status": null,
+  "total": 2,
+  "limit": 20,
+  "offset": 0,
+  "counts": {"feasible": 1, "infeasible": 1, "inconclusive": 0},
+  "items": [
+    {
+      "audit_id": "…",
+      "created_at": "2026-09-22T08:00:00+00:00",
+      "status": "feasible",
+      "root_plugin": "megaplugin@1.0.0",
+      "match_type": "resolution",
+      "level": 2,
+      "versions": ["1.5.0"],
+      "chains": [
+        [
+          {"package": "megaplugin", "version_range": "=1.0.0", "version": "1.0.0"},
+          {"package": "authkit",    "version_range": "=1.2.0", "version": "1.2.0"},
+          {"package": "core-lib",   "version_range": ">=1.4.0 <2.0.0", "version": "1.5.0"}
+        ]
+      ],
+      "conflict_packages": []
+    },
+    {
+      "audit_id": "…",
+      "created_at": "2026-09-21T10:00:00+00:00",
+      "status": "infeasible",
+      "root_plugin": null,
+      "match_type": "conflict",
+      "level": 2,
+      "versions": ["2.0.0"],
+      "chains": [
+        [
+          {"package": "<manifest>", "version_range": "*", "version": null},
+          {"package": "loggerkit",  "version_range": "=0.9.0", "version": "0.9.0"},
+          {"package": "core-lib",   "version_range": "^2.0.0", "version": "2.0.0"}
+        ]
+      ],
+      "conflict_packages": ["core-lib"]
+    }
+  ]
+}
+```
+
+约定：
+
+- 结果按 `level` 升序、`created_at` 降序（新审计在前）、`audit_id` 升序稳定排序，
+  `limit`（1～100，默认 20）/`offset` 分页，`counts` 汇总 feasible/infeasible/inconclusive；
+- 不提供 `version` 时按包聚合：同一条审计只返回一条记录，`versions` 列出命中的具体版本
+  （`resolution` 命中恰一个，`conflict` 命中可多个）；
+- **未知包（或该包没有任何版本参与过审计）返回空结果 `total=0`，HTTP 仍为 200，不是 404**；
+- 非法 `version` 返回 `400`，非法 `status` 返回 `422`。
+
+### 5. 导出可验证审计包并校验
 
 把**按创建时间排序**的 `audit_id` 列表（1～100 个、不可重复）交给导出接口，
 得到确定性的 JSONL 导出包：每条记录是规范化 JSON（键排序、紧凑、UTF-8），
@@ -218,6 +297,7 @@ def verify(gzip_base64):
 | `GET`  | `/health` | 健康检查（含数据库连通性与注册表包数量） |
 | `POST` | `/api/v1/audits` | 提交清单进行审计，返回求解结果并落库（`201`） |
 | `GET`  | `/api/v1/audits` | 审计记录列表，支持 `status` / `limit` / `offset` |
+| `GET`  | `/api/v1/audits/impact/{package_name}` | 历史影响反查：沿来源链找出直接/传递依赖该包（可加 `version`）的审计，可选 `status` / `limit` / `offset`；未知包返回空结果 |
 | `GET`  | `/api/v1/audits/{id}` | 查询单条审计的完整结果 |
 | `POST` | `/api/v1/audits/export-bundle` | 把已有审计结果打包为确定性、可验证的 JSONL 导出包（只读，不写库） |
 | `POST` | `/api/v1/audits/verify-bundle` | 校验导出包：manifest、记录顺序、逐条摘要、整体摘要（不写库） |
@@ -280,6 +360,7 @@ app/
   semver.py     # SemVer 2.0.0 与版本范围解析
   database.py   # SQLite 建表/注册表/审计记录
   models.py     # Pydantic 请求/响应模型
+  impact.py     # 历史影响反查：扫描 resolution/sources/conflicts 沿来源链计算命中
   bundle.py     # 可验证 JSONL 导出包的确定性构造与校验（sha256/gzip，纯内存）
 data/
   seed_registry.json   # 示例注册表

@@ -158,6 +158,46 @@ class AuditResponse(BaseModel):
     conflicts: List[ConflictOut]
 
 
+# ---------- 历史影响反查 ----------
+
+class ImpactCounts(BaseModel):
+    feasible: int = 0
+    infeasible: int = 0
+    inconclusive: int = 0
+
+
+class ImpactMatchOut(BaseModel):
+    audit_id: str
+    created_at: str
+    status: Literal["feasible", "infeasible", "inconclusive"]
+    root_plugin: Optional[str]
+    match_type: Literal["resolution", "conflict"] = Field(
+        ..., description="resolution=可行解命中；conflict=冲突约束（含来源链中间跳）命中"
+    )
+    level: int = Field(..., ge=0, description="命中层级：根插件 0，清单直接依赖 1，逐跳 +1")
+    versions: List[str] = Field(
+        ..., description="该审计中命中的具体版本（resolution 恰一个，conflict 可多个）"
+    )
+    chains: List[List[ConflictStepOut]] = Field(
+        ..., description="最短的若干条来源链证据（根跳 <manifest> 到命中包）"
+    )
+    conflict_packages: List[str] = Field(
+        default_factory=list,
+        description="match_type=conflict 时，命中所关联的冲突目标包（去重排序）",
+    )
+
+
+class ImpactResponse(BaseModel):
+    package: str
+    version: Optional[str] = None
+    status: Optional[Literal["feasible", "infeasible", "inconclusive"]] = None
+    total: int
+    limit: int
+    offset: int
+    counts: ImpactCounts = Field(..., description="按审计状态汇总的命中计数")
+    items: List[ImpactMatchOut] = Field(..., description="按层级升序、创建时间降序稳定排序")
+
+
 # ---------- 可验证导出包 ----------
 
 class BundleExportIn(BaseModel):

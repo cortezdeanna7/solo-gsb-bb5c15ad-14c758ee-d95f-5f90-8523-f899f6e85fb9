@@ -178,3 +178,22 @@ def count_audits(conn: sqlite3.Connection, status: Optional[str] = None) -> int:
             conn.execute("SELECT COUNT(*) FROM audits WHERE status = ?", (status,)).fetchone()[0]
         )
     return int(conn.execute("SELECT COUNT(*) FROM audits").fetchone()[0])
+
+
+def list_audit_results(
+    conn: sqlite3.Connection,
+    status: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> List[sqlite3.Row]:
+    """拉取审计结果（含完整 result_json），供离线扫描类查询使用。"""
+    sql = "SELECT id, created_at, status, root_plugin, result_json FROM audits"
+    params: List[Any] = []
+    if status:
+        sql += " WHERE status = ?"
+        params.append(status)
+    sql += " ORDER BY created_at DESC, id"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+    return conn.execute(sql, params).fetchall()
