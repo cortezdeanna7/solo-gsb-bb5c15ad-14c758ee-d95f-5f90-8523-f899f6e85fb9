@@ -178,3 +178,14 @@ def count_audits(conn: sqlite3.Connection, status: Optional[str] = None) -> int:
             conn.execute("SELECT COUNT(*) FROM audits WHERE status = ?", (status,)).fetchone()[0]
         )
     return int(conn.execute("SELECT COUNT(*) FROM audits").fetchone()[0])
+
+
+def iter_audits(conn: sqlite3.Connection, status: Optional[str] = None) -> Iterator[sqlite3.Row]:
+    """遍历全部审计记录（按创建时间倒序），供全量扫描类查询使用。"""
+    if status:
+        yield from conn.execute(
+            "SELECT * FROM audits WHERE status = ? ORDER BY created_at DESC, id",
+            (status,),
+        )
+    else:
+        yield from conn.execute("SELECT * FROM audits ORDER BY created_at DESC, id")

@@ -24,11 +24,13 @@ from .database import (
     get_audit,
     init_db,
     insert_audit,
+    iter_audits,
     list_audits,
     load_registry,
     package_count,
     upsert_package,
 )
+from .impact import build_impact
 from .models import (
     AuditResponse,
     AuditSummary,
@@ -37,10 +39,11 @@ from .models import (
     BundleVerifyIn,
     BundleVerifyResponse,
     HealthResponse,
+    ImpactResponse,
     ManifestIn,
     PackageIn,
 )
-from .semver import VersionError
+from .semver import Version, VersionError
 from .solver import Solver
 
 SEED_PATH = os.environ.get("AUDIT_SEED_PATH", "/app/data/seed_registry.json")
@@ -98,6 +101,7 @@ def index() -> dict:
             "POST /api/v1/audits",
             "GET /api/v1/audits",
             "GET /api/v1/audits/{audit_id}",
+            "GET /api/v1/audits/impact/{package_name}",
             "POST /api/v1/audits/export-bundle",
             "POST /api/v1/audits/verify-bundle",
             "PUT /api/v1/registry/packages/{name}",
@@ -222,6 +226,108 @@ def get_audit_detail(audit_id: str, request: Request) -> AuditResponse:
         raise HTTPException(status_code=404, detail=f"审计记录不存在: {audit_id}")
     result = json.loads(row["result_json"])
     return AuditResponse(**result)
+
+
+@app.get(
+    "/api/v1/audits/impact/{package_name}",
+    response_model=ImpactResponse,
+    tags=["audits"],
+    summary="历史影响反查：哪些审计直接或传递依赖了该包/版本",
+    responses={
+        200: {
+            "description": "命中的审计记录（未知包同样返回 200 与空结果，不返回 404）",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "package": "core-lib",
+                        "version": None,
+                        "limit": 20,
+                        "total": 2,
+                        "summary": {
+                            "total": 2,
+                            "feasible": 1,
+                            "infeasible": 1,
+                            "inconclusive": 0,
+                            "resolution_hits": 1,
+                            "conflict_hits": 1,
+                            "root": 0,
+                            "direct": 1,
+                            "transitive": 1,
+                        },
+                        "versions": [
+                            {"version": "1.5.0", "total": 1, "feasible": 1, "infeasible": 0},
+                            {"version": "2.0.0", "total": 1, "feasible": 0, "infeasible": 1},
+                        ],
+                        "items": [
+                            {
+                                "audit_id": "b1f2…",
+                                "created_at": "2026-09-22T10:00:00.000000+00:00",
+                                "status": "infeasible",
+                                "root_plugin": None,
+                                "depth": 1,
+                                "direct": True,
+                                "as_root": False,
+                                "versions": ["2.0.0"],
+                                "match_types": ["conflict"],
+                                "resolution_match": False,
+                                "conflict_match": True,
+                                "conflict_kinds": ["selection_conflict"],
+                                "matches": [
+                                    {
+                                        "match_type": "conflict",
+                                        "role": "constrained",
+                                        "depth": 1,
+                                        "direct": True,
+                                        "as_root": False,
+                                        "version": "2.0.0",
+                                        "version_range": "^2.0.0",
+                                        "conflict_kind": "selection_conflict",
+                                        "conflict_package": "core-lib",
+                                        "locked_version": "2.0.0",
+                                        "minimal_chain": True,
+                                        "source_chain": [
+                                            {"package": "<manifest>", "version_range": "*", "version": None},
+                                            {"package": "loggerkit", "version_range": "=0.9.0", "version": "0.9.0"},
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+    },
+)
+def get_package_impact(
+    package_name: str,
+    request: Request,
+    version: Optional[str] = Query(
+        None,
+        description="可选，精确匹配具体版本（需为合法 SemVer）；省略时按包聚合全部版本",
+        examples={
+            "aggregate": {"summary": "省略：按包聚合", "value": None},
+            "pinned": {"summary": "精确版本", "value": "1.5.0"},
+        },
+    ),
+    status_filter: Optional[str] = Query(
+        None,
+        alias="status",
+        pattern="^(feasible|infeasible|inconclusive)$",
+        description="可选，仅扫描指定状态的审计记录",
+    ),
+    limit: int = Query(20, ge=1, le=MAX_LIMIT, description="返回记录上限（汇总计数不受影响）"),
+) -> ImpactResponse:
+    if version is not None:
+        try:
+            version = str(Version.parse(version))
+        except VersionError as exc:
+            raise HTTPException(status_code=422, detail=f"非法版本 {version!r}: {exc}") from exc
+
+    conn = get_conn(request)
+    rows = iter_audits(conn, status=status_filter)
+    body = build_impact(rows, package=package_name, version=version, limit=limit)
+    return ImpactResponse(**body)
 
 
 @app.post(

@@ -158,6 +158,89 @@ class AuditResponse(BaseModel):
     conflicts: List[ConflictOut]
 
 
+# ---------- 历史影响反查 ----------
+
+
+class ImpactMatchOut(BaseModel):
+    """单条审计内的一处命中（resolution 命中或冲突约束命中）。"""
+
+    match_type: Literal["resolution", "conflict"] = Field(
+        ..., description="resolution=可行解命中；conflict=冲突约束/来源链命中"
+    )
+    role: Literal["resolved", "constrained", "requester"] = Field(
+        ...,
+        description=(
+            "resolved=可行解中被选中；constrained=作为冲突对象被约束；"
+            "requester=仅出现在来源链上（传递参与）"
+        ),
+    )
+    depth: int = Field(..., description="命中层级：0=根插件自身，1=直接依赖，>=2=传递依赖")
+    direct: bool
+    as_root: bool
+    version: Optional[str] = Field(None, description="命中的具体版本（range 冲突无版本时为 null）")
+    version_range: Optional[str] = Field(None, description="该跳/该约束声明的版本范围")
+    conflict_kind: Optional[
+        Literal["range_conflict", "selection_conflict", "package_missing"]
+    ] = None
+    conflict_package: Optional[str] = Field(None, description="冲突所属的包")
+    locked_version: Optional[str] = None
+    minimal_chain: bool = Field(
+        ..., description="该约束是否出现在最小冲突链中（resolution 命中恒为 true）"
+    )
+    source_chain: List[ConflictStepOut] = Field(
+        ..., description="从根跳到命中位置的逐跳来源链"
+    )
+
+
+class ImpactItemOut(BaseModel):
+    audit_id: str
+    created_at: str
+    status: Literal["feasible", "infeasible", "inconclusive"]
+    root_plugin: Optional[str]
+    depth: int = Field(..., description="该审计内全部命中的最小层级")
+    direct: bool = Field(..., description="最小层级是否为直接依赖（depth=1）")
+    as_root: bool
+    versions: List[str] = Field(..., description="该审计内命中的全部具体版本")
+    match_types: List[Literal["resolution", "conflict"]]
+    resolution_match: bool
+    conflict_match: bool
+    conflict_kinds: List[
+        Literal["range_conflict", "selection_conflict", "package_missing"]
+    ]
+    matches: List[ImpactMatchOut]
+
+
+class ImpactVersionCountOut(BaseModel):
+    version: str
+    total: int
+    feasible: int
+    infeasible: int
+
+
+class ImpactSummaryOut(BaseModel):
+    total: int
+    feasible: int
+    infeasible: int
+    inconclusive: int
+    resolution_hits: int
+    conflict_hits: int
+    root: int
+    direct: int
+    transitive: int
+
+
+class ImpactResponse(BaseModel):
+    package: str
+    version: Optional[str]
+    limit: int
+    total: int = Field(..., description="命中审计总数（limit 之前）")
+    summary: ImpactSummaryOut
+    versions: List[ImpactVersionCountOut] = Field(
+        ..., description="按版本聚合的命中计数（未指定 version 时覆盖全部版本）"
+    )
+    items: List[ImpactItemOut]
+
+
 # ---------- 可验证导出包 ----------
 
 class BundleExportIn(BaseModel):
